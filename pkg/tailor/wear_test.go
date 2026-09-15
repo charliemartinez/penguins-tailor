@@ -5,7 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/pieroproietti/penguins-tailor/pkg/distro"
 )
 
 func TestWearRefreshesBeforeSuit(t *testing.T) {
@@ -454,5 +457,167 @@ cmds:
 	}
 	if len(suit.FinalizeCmds) != 2 {
 		t.Errorf("expected 2 finalize commands in legacy format, got %d", len(suit.FinalizeCmds))
+	}
+}
+
+func TestWear_UnsupportedDistro_Declined(t *testing.T) {
+	tempDir := t.TempDir()
+	costumeDir := filepath.Join(tempDir, "v2", "costumes", "test-unsupported")
+	if err := os.MkdirAll(costumeDir, 0755); err != nil {
+		t.Fatalf("failed to create costume fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(costumeDir, "index.yaml"), []byte("name: test-unsupported\n"), 0644); err != nil {
+		t.Fatalf("failed to write costume fixture: %v", err)
+	}
+
+	originalNewDistro := newWearDistro
+	originalPromptConfirm := promptWearConfirm
+	originalGetWardrobeRoot := getWearWardrobeRoot
+	originalGetWearWardrobeV2Dir := getWearWardrobeV2Dir
+
+	newWearDistro = func() *distro.Distro {
+		return &distro.Distro{
+			DistroID: "fedora",
+			FamilyID: "fedora",
+		}
+	}
+	promptWearConfirm = func(string) bool {
+		return false
+	}
+	getWearWardrobeRoot = func() (string, error) { return tempDir, nil }
+	getWearWardrobeV2Dir = func() (string, error) { return filepath.Join(tempDir, "v2"), nil }
+
+	t.Cleanup(func() {
+		newWearDistro = originalNewDistro
+		promptWearConfirm = originalPromptConfirm
+		getWearWardrobeRoot = originalGetWardrobeRoot
+		getWearWardrobeV2Dir = originalGetWearWardrobeV2Dir
+	})
+
+	err := Wear("test-unsupported", true, "", true)
+	if err == nil {
+		t.Fatal("expected error on unsupported distro when user declines prompt, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported distribution family") {
+		t.Fatalf("expected unsupported distribution family error, got: %v", err)
+	}
+}
+
+func TestWear_UnsupportedDistro_Accepted(t *testing.T) {
+	tempDir := t.TempDir()
+	v2Dir := filepath.Join(tempDir, "v2")
+	costumeDir := filepath.Join(v2Dir, "costumes", "test-costume")
+	accDir := filepath.Join(v2Dir, "accessories", "test-acc")
+
+	if err := os.MkdirAll(costumeDir, 0755); err != nil {
+		t.Fatalf("failed to create costume fixture: %v", err)
+	}
+	if err := os.MkdirAll(accDir, 0755); err != nil {
+		t.Fatalf("failed to create accessory fixture: %v", err)
+	}
+
+	costumeYaml := `name: test-costume
+accessories:
+  - test-acc
+`
+	if err := os.WriteFile(filepath.Join(costumeDir, "index.yaml"), []byte(costumeYaml), 0644); err != nil {
+		t.Fatalf("failed to write costume fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(accDir, "index.yaml"), []byte("name: test-acc\n"), 0644); err != nil {
+		t.Fatalf("failed to write accessory fixture: %v", err)
+	}
+
+	var appliedSysroots []string
+	var skelCopied bool
+
+	originalNewDistro := newWearDistro
+	originalPromptConfirm := promptWearConfirm
+	originalGetWardrobeRoot := getWearWardrobeRoot
+	originalGetWearWardrobeV2Dir := getWearWardrobeV2Dir
+	originalApplySysroot := applyWearSysroot
+	originalCopySkel := copyWearSkelToUser
+
+	newWearDistro = func() *distro.Distro {
+		return &distro.Distro{
+			DistroID: "archlinux",
+			FamilyID: "archlinux",
+		}
+	}
+	promptWearConfirm = func(string) bool {
+		return true
+	}
+	getWearWardrobeRoot = func() (string, error) { return tempDir, nil }
+	getWearWardrobeV2Dir = func() (string, error) { return v2Dir, nil }
+	applyWearSysroot = func(dir string, suitName string, dryRun bool, isAccessory bool) {
+		appliedSysroots = append(appliedSysroots, suitName)
+	}
+	copyWearSkelToUser = func(dryRun bool) {
+		skelCopied = true
+	}
+
+	t.Cleanup(func() {
+		newWearDistro = originalNewDistro
+		promptWearConfirm = originalPromptConfirm
+		getWearWardrobeRoot = originalGetWardrobeRoot
+		getWearWardrobeV2Dir = originalGetWearWardrobeV2Dir
+		applyWearSysroot = originalApplySysroot
+		copyWearSkelToUser = originalCopySkel
+	})
+
+	err := Wear("test-costume", true, "", true)
+	if err != nil {
+		t.Fatalf("Wear failed on accepted unsupported distro: %v", err)
+	}
+
+	if !skelCopied {
+		t.Errorf("expected copyWearSkelToUser to be called")
+	}
+
+	// Verify both accessory and costume sysroot were applied
+	if !slices.Contains(appliedSysroots, "test-acc") {
+		t.Errorf("expected test-acc sysroot to be applied, got: %v", appliedSysroots)
+	}
+	if !slices.Contains(appliedSysroots, "test-costume") {
+		t.Errorf("expected test-costume sysroot to be applied, got: %v", appliedSysroots)
+	}
+}
+
+func TestResolveAccessoryDir(t *testing.T) {
+	v2Dir := "/path/to/v2"
+	parentDir := "/path/to/v2/costumes/colibri"
+
+	if got := resolveAccessoryDir(v2Dir, parentDir, "./local-acc"); got != "/path/to/v2/costumes/colibri/local-acc" {
+		t.Errorf("resolveAccessoryDir(./local-acc) = %s, want /path/to/v2/costumes/colibri/local-acc", got)
+	}
+	if got := resolveAccessoryDir(v2Dir, parentDir, "accessories/eggs-dev"); got != "/path/to/v2/accessories/eggs-dev" {
+		t.Errorf("resolveAccessoryDir(accessories/eggs-dev) = %s, want /path/to/v2/accessories/eggs-dev", got)
+	}
+	if got := resolveAccessoryDir(v2Dir, parentDir, "base"); got != "/path/to/v2/accessories/base" {
+		t.Errorf("resolveAccessoryDir(base) = %s, want /path/to/v2/accessories/base", got)
+	}
+}
+
+func TestResolveCostumeDir(t *testing.T) {
+	tempDir := t.TempDir()
+	v2Dir := filepath.Join(tempDir, "v2")
+	costumeDir := filepath.Join(v2Dir, "costumes", "my-costume")
+	accDir := filepath.Join(v2Dir, "accessories", "my-acc")
+
+	_ = os.MkdirAll(costumeDir, 0755)
+	_ = os.MkdirAll(accDir, 0755)
+
+	got, err := resolveCostumeDir(v2Dir, "my-costume")
+	if err != nil || got != costumeDir {
+		t.Errorf("resolveCostumeDir(my-costume) = %s, err = %v; want %s", got, err, costumeDir)
+	}
+
+	got, err = resolveCostumeDir(v2Dir, "my-acc")
+	if err != nil || got != accDir {
+		t.Errorf("resolveCostumeDir(my-acc) = %s, err = %v; want %s", got, err, accDir)
+	}
+
+	_, err = resolveCostumeDir(v2Dir, "nonexistent")
+	if err == nil {
+		t.Errorf("resolveCostumeDir(nonexistent) expected error, got nil")
 	}
 }

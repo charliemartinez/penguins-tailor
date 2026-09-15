@@ -13,29 +13,40 @@ import (
 )
 
 var (
+	newWearDistro         = distro.NewDistro
 	newWearPackageManager = newPackageManager
 	ensureWearHeaders     = ensureKernelHeaders
 	applyWearSuit         = applySuit
 	getWearWardrobeRoot   = getWardrobeRoot
 	getWearWardrobeV2Dir  = getWardrobeV2Dir
+	promptWearConfirm     = promptConfirm
+	applyWearSysroot      = applySysroot
+	copyWearSkelToUser    = copySkelToUser
 )
 
 func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
-	d := distro.NewDistro()
+	d := newWearDistro()
 	systemIdentity := d.Identity()
-	if d.FamilyID != "debian" && d.FamilyID != "archlinux" {
-		utils.LogError("Distribution '%s' (family: %s) is not supported. Tailor currently supports Debian and Arch derivatives.", d.DistroID, d.FamilyID)
-		return fmt.Errorf("unsupported distribution family: %s", d.FamilyID)
-	}
 
 	if os.Geteuid() != 0 && !dryRun {
 		utils.LogError("'tailor wear' needs to install packages and write to system paths; run it as root (e.g. 'sudo tailor wear %s').", costumeName)
 		return fmt.Errorf("must be run as root")
 	}
-	pm, err := newWearPackageManager(d.FamilyID)
-	if err != nil {
-		return err
+
+	pm, errPm := newWearPackageManager(d.FamilyID)
+	if errPm != nil {
+		distroName := d.DistroID
+		if distroName == "" {
+			distroName = d.FamilyID
+		}
+		utils.LogWarning("Distribution '%s' (family: %s) is not supported.", distroName, d.FamilyID)
+		if !promptWearConfirm("Do you want to copy sysroot to / and configure the user home directory?") {
+			utils.LogError("Distribution '%s' (family: %s) is not supported. Tailor currently supports Debian derivatives.", distroName, d.FamilyID)
+			return fmt.Errorf("unsupported distribution family: %s", d.FamilyID)
+		}
+		return wearSysrootOnly(costumeName, linear, branch, dryRun, systemIdentity)
 	}
+
 	if err := pm.Refresh(); err != nil {
 		return fmt.Errorf("failed to refresh package metadata: %w", err)
 	}
@@ -65,19 +76,9 @@ func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
 		utils.LogError("Wardrobe root error: %v", err)
 		return err
 	}
-	costumeDir := filepath.Join(v2Dir, "costumes", costumeName)
-	if _, err := os.Stat(costumeDir); os.IsNotExist(err) {
-		if strings.HasPrefix(costumeName, "accessories/") || strings.HasPrefix(costumeName, "costumes/") {
-			costumeDir = filepath.Join(v2Dir, costumeName)
-		} else {
-			accDir := filepath.Join(v2Dir, "accessories", costumeName)
-			if _, errAcc := os.Stat(accDir); errAcc == nil {
-				costumeDir = accDir
-			}
-		}
-	}
-	if _, err := os.Stat(costumeDir); os.IsNotExist(err) {
-		return fmt.Errorf("costume '%s' not found in %s", costumeName, costumeDir)
+	costumeDir, err := resolveCostumeDir(v2Dir, costumeName)
+	if err != nil {
+		return err
 	}
 
 	yamlFile := findYaml(costumeDir)
@@ -204,14 +205,7 @@ func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
 			utils.PrintSection("👝", fmt.Sprintf("ACCESSORIES (%d items)", len(suit.Accessories)))
 		}
 		for idx, accName := range suit.Accessories {
-			var accDir string
-			if strings.HasPrefix(accName, "./") || strings.HasPrefix(accName, "../") {
-				accDir = filepath.Join(costumeDir, accName)
-			} else if strings.HasPrefix(accName, "accessories/") {
-				accDir = filepath.Join(v2Dir, accName)
-			} else {
-				accDir = filepath.Join(v2Dir, "accessories", accName)
-			}
+			accDir := resolveAccessoryDir(v2Dir, costumeDir, accName)
 
 			if accYaml := findYaml(accDir); accYaml != "" {
 				if accSuit, err := loadSuit(accYaml); err == nil {
@@ -229,14 +223,7 @@ func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
 					// If the accessory defines nested accessories, apply them recursively
 					if len(accSuit.Accessories) > 0 {
 						for subIdx, subAccName := range accSuit.Accessories {
-							var subAccDir string
-							if strings.HasPrefix(subAccName, "./") || strings.HasPrefix(subAccName, "../") {
-								subAccDir = filepath.Join(accDir, subAccName)
-							} else if strings.HasPrefix(subAccName, "accessories/") {
-								subAccDir = filepath.Join(v2Dir, subAccName)
-							} else {
-								subAccDir = filepath.Join(v2Dir, "accessories", subAccName)
-							}
+							subAccDir := resolveAccessoryDir(v2Dir, accDir, subAccName)
 							if subAccYaml := findYaml(subAccDir); subAccYaml != "" {
 								if subAccSuit, err := loadSuit(subAccYaml); err == nil {
 									if ss != nil {
@@ -315,7 +302,7 @@ func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
 	}
 
 	// Costume Sysroot Overlay
-	applySysroot(costumeDir, suit.Name, dryRun, false)
+	applyWearSysroot(costumeDir, suit.Name, dryRun, false)
 
 	// Costume Finalization commands
 	if len(suit.FinalizeCmds) > 0 {
@@ -336,7 +323,7 @@ func Wear(costumeName string, linear bool, branch string, dryRun bool) error {
 		if ss != nil {
 			ss.SetAction("Synchronizing user environment (/etc/skel -> /home/%s)...", targetUser)
 		}
-		copySkelToUser(dryRun)
+		copyWearSkelToUser(dryRun)
 		if ss != nil {
 			statusMsg := fmt.Sprintf("User environment synchronized (%s)", targetUser)
 			if dryRun {
@@ -611,7 +598,7 @@ func applySuit(dir string, suit *Suit, dryRun bool, isAccessory bool, pm Package
 
 	// For accessories, apply their sysroot overlay right after their packages
 	if isAccessory {
-		applySysroot(dir, suit.Name, dryRun, true)
+		applyWearSysroot(dir, suit.Name, dryRun, true)
 	}
 
 	// Sequence commands (intermediate commands defined in sequence.cmds)
@@ -830,4 +817,248 @@ func rebootSystem() {
 			_ = exec.Command("shutdown", "-r", "now").Run()
 		}
 	}
+}
+
+func promptConfirm(question string) bool {
+	if !isInteractiveTerminal() {
+		return false
+	}
+	cyan := utils.ColorCyan
+	reset := utils.ColorReset
+	if utils.DisableColors {
+		cyan = ""
+		reset = ""
+	}
+	fmt.Printf("\n%s[tailor]%s %s [y/N]: ", cyan, reset, question)
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	input = strings.TrimSpace(strings.ToLower(input))
+	return input == "y" || input == "yes"
+}
+
+func resolveCostumeDir(v2Dir, costumeName string) (string, error) {
+	costumeDir := filepath.Join(v2Dir, "costumes", costumeName)
+	if _, err := os.Stat(costumeDir); os.IsNotExist(err) {
+		if strings.HasPrefix(costumeName, "accessories/") || strings.HasPrefix(costumeName, "costumes/") {
+			costumeDir = filepath.Join(v2Dir, costumeName)
+		} else {
+			accDir := filepath.Join(v2Dir, "accessories", costumeName)
+			if _, errAcc := os.Stat(accDir); errAcc == nil {
+				costumeDir = accDir
+			}
+		}
+	}
+	if _, err := os.Stat(costumeDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("costume '%s' not found in %s", costumeName, costumeDir)
+	}
+	return costumeDir, nil
+}
+
+func resolveAccessoryDir(v2Dir, parentDir, accName string) string {
+	if strings.HasPrefix(accName, "./") || strings.HasPrefix(accName, "../") {
+		return filepath.Join(parentDir, accName)
+	}
+	if strings.HasPrefix(accName, "accessories/") {
+		return filepath.Join(v2Dir, accName)
+	}
+	return filepath.Join(v2Dir, "accessories", accName)
+}
+
+func applyAccessoriesSysroot(v2Dir, parentDir string, accessories []string, dryRun bool) {
+	for _, accName := range accessories {
+		accDir := resolveAccessoryDir(v2Dir, parentDir, accName)
+		accYaml := findYaml(accDir)
+		if accYaml == "" {
+			continue
+		}
+		accSuit, err := loadSuit(accYaml)
+		if err != nil {
+			continue
+		}
+		if len(accSuit.Accessories) > 0 {
+			applyAccessoriesSysroot(v2Dir, accDir, accSuit.Accessories, dryRun)
+		}
+		applyWearSysroot(accDir, accSuit.Name, dryRun, true)
+	}
+}
+
+func wearSysrootOnly(costumeName string, linear bool, branch string, dryRun bool, systemIdentity string) error {
+	root, err := getWearWardrobeRoot()
+	if err != nil {
+		utils.LogError("Wardrobe root error: %v", err)
+		return err
+	}
+
+	if branch != "" {
+		if err := Get("", branch); err != nil {
+			return fmt.Errorf("failed to get costumes repository on branch '%s': %w", branch, err)
+		}
+	} else if _, errStat := os.Stat(root); os.IsNotExist(errStat) {
+		if stat, errV2 := os.Stat("v2"); errV2 != nil || !stat.IsDir() {
+			if err := Get("", ""); err != nil {
+				return fmt.Errorf("failed to download costumes repository: %w", err)
+			}
+		}
+	}
+
+	v2Dir, err := getWearWardrobeV2Dir()
+	if err != nil {
+		utils.LogError("Wardrobe root error: %v", err)
+		return err
+	}
+
+	costumeDir, err := resolveCostumeDir(v2Dir, costumeName)
+	if err != nil {
+		return err
+	}
+
+	yamlFile := findYaml(costumeDir)
+	suit, err := loadSuit(yamlFile)
+	if err != nil {
+		return err
+	}
+
+	isDirectAccessory := strings.HasPrefix(costumeName, "accessories/") || (suit.Name != "" && !strings.Contains(costumeDir, "/costumes/"))
+
+	origin := GetWardrobeOrigin()
+	activeBranch := GetWardrobeBranch()
+
+	costumeLabel := fmt.Sprintf("Costume: %s", suit.Name)
+	if suit.Release != "" {
+		costumeLabel = fmt.Sprintf("Costume: %s (v%s)", suit.Name, suit.Release)
+	}
+	if isDirectAccessory {
+		costumeLabel = fmt.Sprintf("Accessory: %s", suit.Name)
+		if suit.Release != "" {
+			costumeLabel = fmt.Sprintf("Accessory: %s (v%s)", suit.Name, suit.Release)
+		}
+	}
+
+	notes := suit.Description
+	if notes != "" {
+		notes += " - (sysroot & home only)"
+	} else {
+		notes = "Sysroot & home only"
+	}
+	if dryRun {
+		notes = "[DRY-RUN] " + notes
+	}
+
+	headerCfg := utils.SplitScreenConfig{
+		Atelier: origin,
+		System:  systemIdentity,
+		Costume: costumeLabel,
+		Branch:  activeBranch,
+		Notes:   notes,
+	}
+
+	var ss *utils.SplitScreen
+	if !linear {
+		ss = utils.StartSplitScreenConfig(headerCfg)
+		if ss != nil {
+			defer ss.Close()
+		}
+	}
+	if ss == nil {
+		utils.PrintBannerConfig(headerCfg)
+	}
+
+	// Apply accessories sysroot
+	if len(suit.Accessories) > 0 {
+		if ss != nil {
+			ss.SetAction("Applying accessories sysroot (%d items)...", len(suit.Accessories))
+		} else {
+			utils.PrintSection("👝", fmt.Sprintf("ACCESSORIES (%d items)", len(suit.Accessories)))
+		}
+		applyAccessoriesSysroot(v2Dir, costumeDir, suit.Accessories, dryRun)
+		if ss != nil {
+			ss.AddStep(fmt.Sprintf("%s[OK]%s Accessories sysroot applied", utils.ColorGreen, utils.ColorReset))
+		}
+	}
+
+	// Apply costume sysroot
+	if ss != nil {
+		costumeActionTag := "Costume"
+		if isDirectAccessory {
+			costumeActionTag = "Accessory"
+		}
+		ss.SetAction("%s: %s, applying system configuration (sysroot)...", costumeActionTag, suit.Name)
+	} else {
+		utils.PrintSubSection("-->", fmt.Sprintf("Applying system configuration (sysroot) for %s...", suit.Name))
+	}
+	applyWearSysroot(costumeDir, suit.Name, dryRun, false)
+
+	// User environment synchronization
+	targetUser := getTargetUsername()
+	if targetUser != "" && targetUser != "root" {
+		if ss != nil {
+			ss.SetAction("Synchronizing user environment (/etc/skel -> /home/%s)...", targetUser)
+		} else {
+			utils.PrintSubSection("-->", fmt.Sprintf("Synchronizing user environment (/etc/skel -> /home/%s)...", targetUser))
+		}
+		copyWearSkelToUser(dryRun)
+		if ss != nil {
+			statusMsg := fmt.Sprintf("User environment synchronized (%s)", targetUser)
+			if dryRun {
+				statusMsg += " (simulated)"
+			}
+			ss.AddStep(fmt.Sprintf("%s[OK]%s %s", utils.ColorGreen, utils.ColorReset, statusMsg))
+		}
+	}
+
+	// Close split screen before printing final summary box
+	if ss != nil {
+		ss.Close()
+		ss = nil
+	}
+
+	reportPath, reportErr := writeWearReport(wearReport{
+		CostumeName:   suit.Name,
+		System:        systemIdentity,
+		Installed:     nil,
+		Unavailable:   nil,
+		FailedInstall: nil,
+	})
+
+	costumeSummaryVal := suit.Name
+	if dryRun {
+		costumeSummaryVal = fmt.Sprintf("%s [DRY-RUN]", suit.Name)
+	}
+	summaryRows := [][2]string{
+		{"Costume / Item", costumeSummaryVal},
+	}
+	if origin != "" {
+		atelierVal := origin
+		if activeBranch != "" && activeBranch != "main" && activeBranch != "master" {
+			atelierVal = fmt.Sprintf("%s (%s)", origin, activeBranch)
+		}
+		summaryRows = append(summaryRows, [2]string{"Atelier", atelierVal})
+	}
+	summaryRows = append(summaryRows,
+		[2]string{"Mode", "Sysroot & home configuration only"},
+		[2]string{"System configuration", "Applied (sysroot overlay)"},
+	)
+	if targetUser != "" && targetUser != "root" {
+		userStatus := fmt.Sprintf("Synchronized (/home/%s)", targetUser)
+		if dryRun {
+			userStatus += " (simulated)"
+		}
+		summaryRows = append(summaryRows, [2]string{"User environment", userStatus})
+	}
+	if reportErr == nil {
+		summaryRows = append(summaryRows, [2]string{"Detailed report", reportPath})
+	}
+	if !dryRun {
+		summaryRows = append(summaryRows, [2]string{"System log", tailorLogFile})
+	}
+
+	summaryTitle := "✨ WEAR COMPLETED (SYSROOT ONLY)!"
+	if dryRun {
+		summaryTitle = "✨ WEAR COMPLETED (SIMULATION - SYSROOT ONLY)!"
+	}
+	utils.PrintSummaryBox(summaryTitle, summaryRows)
+	return nil
 }
